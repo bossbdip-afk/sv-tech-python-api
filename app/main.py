@@ -10,12 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth, credentials, firestore
 
 from .parser import parse_pdf_bytes
-
 APP_NAME = 'SV Tech PDF Backend'
 MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '40'))
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1', 'true', 'yes'}
-
 
 def init_firebase():
     if firebase_admin._apps:
@@ -31,10 +29,9 @@ def init_firebase():
         return
     raise RuntimeError('FIREBASE_SERVICE_ACCOUNT_JSON environment variable is required')
 
-
 init_firebase()
 db = firestore.client()
-app = FastAPI(title=APP_NAME, version='1.0.0')
+app = FastAPI(title=APP_NAME, version='2.0.0')
 
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 app.add_middleware(
@@ -44,7 +41,6 @@ app.add_middleware(
     allow_methods=['GET', 'POST', 'OPTIONS'],
     allow_headers=['*'],
 )
-
 
 async def current_user(authorization: str | None = Header(default=None)):
     if SKIP_AUTH:
@@ -61,7 +57,6 @@ async def current_user(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=403, detail='এই account-এর API permission নেই')
     return decoded
 
-
 def safe_doc_id(row: dict) -> str:
     voter = str(row.get('voter_no', '')).strip()
     if voter:
@@ -70,7 +65,6 @@ def safe_doc_id(row: dict) -> str:
     digest = hashlib.sha1(basis.encode('utf-8')).hexdigest()[:20]
     serial = ''.join(ch if ch.isalnum() or ch in '_-' else '_' for ch in str(row.get('serial_no','row')))
     return f's_{digest}_{serial[:80]}'
-
 
 def chunks(seq: List, n: int):
     for i in range(0, len(seq), n):
@@ -88,7 +82,6 @@ def write_rows(rows: List[dict]):
     for ref_chunk in chunks(refs, 400):
         for snap in db.get_all(ref_chunk):
             existing[snap.reference.path] = snap.to_dict() if snap.exists else None
-
     added = updated = unchanged = 0
     write_items = []
     for row, ref in zip(rows, refs):
@@ -101,7 +94,6 @@ def write_rows(rows: List[dict]):
         else:
             updated += 1
             write_items.append((ref, row))
-
     for part in chunks(write_items, 400):
         batch = db.batch()
         for ref, row in part:
@@ -112,8 +104,7 @@ def write_rows(rows: List[dict]):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'service': APP_NAME, 'parser': 'PY-RENDER-V1'}
-
+    return {'ok': True, 'service': APP_NAME, 'parser': 'PY-RENDER-V2-ADDRESS-FIX'}
 
 async def read_pdf(file: UploadFile) -> bytes:
     if file.content_type not in ('application/pdf', 'application/octet-stream') and not file.filename.lower().endswith('.pdf'):
@@ -124,7 +115,6 @@ async def read_pdf(file: UploadFile) -> bytes:
     if len(data) > MAX_PDF_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f'PDF সর্বোচ্চ {MAX_PDF_MB} MB হতে পারবে')
     return data
-
 
 @app.post('/preview')
 async def preview(
@@ -146,9 +136,8 @@ async def preview(
         'records_detected': len(rows),
         'raw_preserved': raw_kept,
         'preview': rows[:20],
-        'parser': 'PY-RENDER-V1',
+        'parser': 'PY-RENDER-V2-ADDRESS-FIX',
     }
-
 
 @app.post('/upload')
 async def upload(
@@ -164,7 +153,6 @@ async def upload(
         raise HTTPException(status_code=422, detail=f'PDF parse করা যায়নি: {e}') from e
     if not rows:
         raise HTTPException(status_code=422, detail='PDF থেকে কোনো Record শনাক্ত করা যায়নি')
-
     added, updated, unchanged = write_rows(rows)
     raw_kept = sum(1 for r in rows if r.get('parse_status') == 'raw_preserved')
     log = {
@@ -172,7 +160,7 @@ async def upload(
         'records_detected': len(rows), 'records_added': added, 'records_updated': updated,
         'records_unchanged': unchanged, 'records_skipped': 0, 'raw_preserved': raw_kept,
         'created_at': datetime.now(timezone.utc).isoformat(), 'uploaded_by': user.get('email', ''),
-        'parser': 'PY-RENDER-V1 — server-side FastAPI/PyMuPDF, raw preserved, no record drop',
+        'parser': 'PY-RENDER-V2-ADDRESS-FIX — full address preserved',
     }
     db.collection('pdf_imports').document('import_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')).set(log)
     return {'ok': True, **log}

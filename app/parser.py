@@ -17,11 +17,9 @@ def clean(s: str) -> str:
 def bn_to_en(s: str) -> str:
     return str(s or '').translate(str.maketrans(BN_DIGITS, EN_DIGITS))
 
-
 LEGACY_RE = re.compile(
     r'[\x80-\x9FËÎÏÐÑÒÔ×ØÙÚÌåêîïõøúûýÿĀăĐēĔėęĢĤĥĦħĨĩĮįıĲĳĴĽĺļńŇŌŐŘřŜśŝšŞŢŦũŬŮűŽžſƀƁƂƃƄƅƆƎƏƣŨūŋ¢µàŀ◌]'
 )
-
 GLYPH_MAP = {
     '\x83': 'ট্', '\x8c': 'ন্', '\x98': 'হ্',
     'Ë': '্য', 'Î': '\uE001', 'Ï': 'ে', 'Ð': 'ৈ', 'Ñ': 'ক', 'Ò': 'ক্ট', 'Ô': 'ক্স', '×': 'ক্ত', 'Ù': 'ক্ষ',
@@ -35,7 +33,6 @@ GLYPH_MAP = {
     'Ũ': 'স্ট', 'Ú': 'ক্ষ্ম', 'Ì': '্ল', 'Ĳ': 'ড়', 'Ŭ': 'ষ্প', 'Ŧ': 'স্ক', 'Į': 'স্ত্র', 'ŀ': 'ভ', '¢': 'ন', 'å': 'গ্রে',
     'ŋ': 'ল',
 }
-
 SAFE_CONTEXT_REPLACEMENTS = [
     (re.compile(r'øানেন্দ্র|øােনন্দ্র'), 'জ্ঞানেন্দ্র'),
     (re.compile(r'মা\s*Ũ[^\u0980-\u09FF]{0,4}র'), 'মাস্টার'),
@@ -55,13 +52,11 @@ SAFE_CONTEXT_REPLACEMENTS = [
     (re.compile(r'তĪী'), 'তিথী'),
 ]
 
-
 def legacy_source(s: str) -> bool:
     x = str(s or '')
     if LEGACY_RE.search(x):
         return True
     return bool(re.search(r'(?:^|[\s:,(])(?:ি|ে|ৈ)[ক-হড়ঢ়য়]|[ক-হড়ঢ়য়]া[িেৈ][ক-হড়ঢ়য়]|তািরখ|ি[পঠ]তা|িঠকানা|ইউিনয়ন|উপেজলা|ভাটার', x))
-
 
 def clean_unicode_bangla(s: str) -> str:
     x = unicodedata.normalize('NFC', str(s or '')).replace('\u00a0', ' ')
@@ -74,7 +69,6 @@ def clean_unicode_bangla(s: str) -> str:
     x = re.sub(r'(^|\s)[,;]+\s*', r'\1', x)
     x = re.sub(r'\s+([।,:;])', r'\1', x)
     return clean(x)
-
 
 def _reorder_prebase(x: str) -> str:
     consonant = re.compile(r'[ক-হড়ঢ়য়]')
@@ -104,7 +98,6 @@ def _reorder_prebase(x: str) -> str:
         i += 1
     return ''.join(out)
 
-
 def repair_legacy_bangla(s: str) -> str:
     x = unicodedata.normalize('NFC', str(s or '')).replace('\u00a0', ' ')
     x = re.sub(r'[\u0000\u200b-\u200f\ufeff\u25cc]', '', x)
@@ -128,7 +121,6 @@ def repair_legacy_bangla(s: str) -> str:
         x = pat.sub(repl, x)
     return clean_unicode_bangla(x)
 
-
 def repair_bangla(s: str) -> str:
     return repair_legacy_bangla(s) if legacy_source(s) else clean_unicode_bangla(s)
 
@@ -139,7 +131,6 @@ def clean_field(s: str) -> str:
     x = re.sub(r'^[\s,.;:।]+', '', x)
     x = re.sub(r'[\s,;]+$', '', x)
     return x.strip()
-
 
 def normalize_profession(s: str) -> str:
     x = clean_field(s)
@@ -162,7 +153,6 @@ class Row:
     items: List[Item]
     text: str
 
-
 def line_text(items: List[Item]) -> str:
     parts = sorted(items, key=lambda z: z.x)
     out = ''
@@ -176,12 +166,7 @@ def line_text(items: List[Item]) -> str:
         prev = it
     return clean(out)
 
-
 def get_rows(page: fitz.Page) -> List[Row]:
-    # Use PDF text spans rather than words. Election Commission PDFs often store
-    # serial + label in one span and split Bangla glyph clusters across spans.
-    # Spans are the closest PyMuPDF equivalent to PDF.js text items used by the
-    # previous browser parser.
     data = page.get_text('dict', sort=False)
     items: List[Item] = []
     for block in data.get('blocks', []):
@@ -215,10 +200,8 @@ def get_rows(page: fitz.Page) -> List[Row]:
             result.append(Row(y=ry, items=sorted(ritems, key=lambda z: z.x), text=txt))
     return result
 
-
 def serial_digits(s: str) -> str:
     return ''.join(re.findall(r'[0-9০-৯]', str(s or '')))
-
 
 def detect_anchors(rows: List[Row]):
     anchors = []
@@ -239,7 +222,6 @@ def detect_anchors(rows: List[Row]):
                     anchors.append({'serial': serial, 'x': it.x, 'y': row.y})
     return anchors
 
-
 def extract_meta(rows: List[Row], anchors, prev: Dict[str, str]):
     if not anchors:
         return dict(prev)
@@ -252,7 +234,6 @@ def extract_meta(rows: List[Row], anchors, prev: Dict[str, str]):
     def pick(pattern, src=header):
         m = re.search(pattern, src, re.I)
         return clean(m.group(1)) if m else ''
-
     raw_ward = re.search(r'ওয়াড\s*Î?\s*(?:নং|ন(?:ń|ং)?র)\s*(?:[-–—:]|：)?\s*([0-9০-৯]{1,2})', raw_header, re.I)
     raw_post = re.search(r'Ï?পা.{0,4}েকাড\s*[:：]\s*([0-9০-৯]{4})', raw_header, re.I)
     meta['district_name'] = pick(r'জেলা\s*[:：]\s*(.*?)\s+(?=উপজেলা|ইউনিয়ন|ডাকঘর|ভোটার)') or meta.get('district_name', '')
@@ -267,22 +248,19 @@ def extract_meta(rows: List[Row], anchors, prev: Dict[str, str]):
 
 
 def clean_address(value: str, page_no: int, district: str) -> str:
+    """Preserve the complete address; remove only a very likely trailing page number.
+
+    Old behavior also de-duplicated comma-separated address parts and could drop a
+    legitimate trailing number whenever the address ended with the district name.
+    That shortened addresses. This version keeps every address component exactly
+    once extracted from the PDF text and strips a trailing 1-3 digit token only
+    when it equals the current PDF page number.
+    """
     x = clean_field(value)
     m = re.search(r'\s+([0-9০-৯]{1,3})\s*$', x)
-    if m:
-        n = bn_to_en(m.group(1))
-        before = x[:m.start()].strip()
-        d = clean_field(district)
-        last = [p.strip() for p in before.split(',') if p.strip()]
-        last_part = last[-1] if last else ''
-        if n == str(page_no) or (d and (last_part == d or before.endswith(d))):
-            x = before
-    parts = [p.strip() for p in x.split(',') if p.strip()]
-    out = []
-    for p in parts:
-        if not out or out[-1] != p:
-            out.append(p)
-    return ', '.join(out)
+    if m and bn_to_en(m.group(1)) == str(page_no):
+        x = x[:m.start()].strip()
+    return clean_field(x)
 
 
 def _field(text: str, pattern: str) -> str:
@@ -294,14 +272,12 @@ def _suspicious(v: str) -> bool:
     s = str(v or '')
     return bool(re.search(r'[\x80-\x9FĥĔėƣŘƃƁĤſŌƀËõøĢĺĴÐŇĨ×ÎÙêēęĽłăŞűįĦƆƂŽÑũûîŮýħåıéūůżŅ]', s) or re.search(r'তািরখ|উপেজলা|ইউিনয়ন|ভাটার|ি[পঠজ]তা|িঠকানা|Ï|Ð', s))
 
-
 def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, carry_meta: Dict[str, str], page_no: int):
     rows = get_rows(page)
     anchors = detect_anchors(rows)
     if not anchors:
         return [], carry_meta
     meta = extract_meta(rows, anchors, {**carry_meta, 'district_name': district, 'upazila_name': upazila})
-
     xs = sorted(set(round(a['x'], 1) for a in anchors))
     centers = []
     for x in xs:
@@ -315,11 +291,9 @@ def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, car
     for i, c in enumerate(centers):
         right = centers[i+1] - left_pad if i < len(centers)-1 else min(width, c + col_gap - left_pad)
         bounds.append((max(0, c-left_pad), right))
-
     by_col = []
     for c in centers:
         by_col.append(sorted([a for a in anchors if abs(a['x'] - c) <= 20], key=lambda a: a['y']))
-
     out = []
     for a in anchors:
         ci = min(range(len(centers)), key=lambda i: abs(centers[i] - a['x']))
@@ -343,6 +317,7 @@ def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, car
         voter = _field(ctext, r'ভোটার\s*নং\s*:\s*([0-9০-৯]+)')
         if not name:
             continue
+        raw_address_value = _field(ctext, r'ঠিকানা\s*:\s*(.*?)(?=\s+[0-9০-৯]{1,6}\s*[.।)]\s*নাম\s*:|$)')
         row = {
             'district_name': district or '', 'upazila_name': upazila or '', 'serial_no': serial,
             'name': name, 'voter_no': voter,
@@ -350,18 +325,18 @@ def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, car
             'mother_name': _field(ctext, r'মাতা\s*:\s*(.*?)(?=\s*পেশা\s*:|$)'),
             'profession': normalize_profession(_field(ctext, r'পেশা\s*:\s*(.*?)(?=\s*জন্ম\s*তারিখ\s*:|$)')),
             'birth_date': _field(ctext, r'জন্ম\s*তারিখ\s*:\s*([0-9০-৯/.-]+)'),
-            'address': clean_address(_field(ctext, r'ঠিকানা\s*:\s*(.*?)(?=\s+[0-9০-৯]{1,6}\s*[.।)]\s*নাম\s*:|$)'), page_no, district),
+            'address': clean_address(raw_address_value, page_no, district),
             'union_name': meta.get('union_name', ''), 'post_office': meta.get('post_office', ''), 'post_code': meta.get('post_code', ''),
             'voter_area': meta.get('voter_area', ''), 'voter_area_code': meta.get('voter_area_code', ''), 'ward_no': meta.get('ward_no', ''),
             'source_file': file_name, 'created_at': datetime.now(timezone.utc).isoformat(),
-            'parser_version': 'PY-RENDER-V1', 'text_encoding': 'unicode-bn-server-v1',
+            'parser_version': 'PY-RENDER-V2-ADDRESS-FIX', 'text_encoding': 'unicode-bn-server-v1',
             'raw_pdf_text': raw_cell, 'parser_source_text': ctext,
         }
         row['raw_name'] = row['name']
         row['raw_father_name'] = row['father_name']
         row['raw_mother_name'] = row['mother_name']
         row['raw_profession'] = row['profession']
-        row['raw_address'] = row['address']
+        row['raw_address'] = raw_address_value
         warnings = []
         for k in ('name','father_name','mother_name','profession','address'):
             if _suspicious(row[k]):
@@ -371,7 +346,6 @@ def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, car
         row['record_key'] = f"v:{voter}" if voter else f"s:{district}|{upazila}|{file_name}|{serial}"
         out.append(row)
     return out, meta
-
 
 def parse_pdf_bytes(data: bytes, district: str, upazila: str, file_name: str) -> List[Dict[str, str]]:
     doc = fitz.open(stream=data, filetype='pdf')
