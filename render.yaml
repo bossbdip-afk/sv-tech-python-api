@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: sv-tech-pdf-api
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    healthCheckPath: /health
+    envVars:
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: MAX_PDF_MB
+        value: "40"
