@@ -31,7 +31,7 @@ def init_firebase():
 
 init_firebase()
 db = firestore.client()
-app = FastAPI(title=APP_NAME, version='3.0.0')
+app = FastAPI(title=APP_NAME, version='4.0.0')
 
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 app.add_middleware(
@@ -104,7 +104,7 @@ def write_rows(rows: List[dict]):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'service': APP_NAME, 'parser': 'PY-RENDER-V3-FULL-ADDRESS'}
+    return {'ok': True, 'service': APP_NAME, 'parser': 'PY-RENDER-V4-ADDRESS-CORRECTED'}
 
 async def read_pdf(file: UploadFile) -> bytes:
     if file.content_type not in ('application/pdf', 'application/octet-stream') and not file.filename.lower().endswith('.pdf'):
@@ -136,7 +136,7 @@ async def preview(
         'records_detected': len(rows),
         'raw_preserved': raw_kept,
         'preview': rows[:20],
-        'parser': 'PY-RENDER-V3-FULL-ADDRESS',
+        'parser': 'PY-RENDER-V4-ADDRESS-CORRECTED',
     }
 
 @app.post('/upload')
@@ -160,7 +160,7 @@ async def upload(
         'records_detected': len(rows), 'records_added': added, 'records_updated': updated,
         'records_unchanged': unchanged, 'records_skipped': 0, 'raw_preserved': raw_kept,
         'created_at': datetime.now(timezone.utc).isoformat(), 'uploaded_by': user.get('email', ''),
-        'parser': 'PY-RENDER-V3-FULL-ADDRESS — header metadata merged into address',
+        'parser': 'PY-RENDER-V4-ADDRESS-CORRECTED — PDF address preserved; layout artifacts cleaned',
     }
     db.collection('pdf_imports').document('import_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')).set(log)
     return {'ok': True, **log}

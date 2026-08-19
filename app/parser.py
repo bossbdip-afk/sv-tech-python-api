@@ -248,64 +248,33 @@ def extract_meta(rows: List[Row], anchors, prev: Dict[str, str]):
 
 
 def clean_address(value: str, page_no: int, district: str) -> str:
-    """Preserve the address text from the voter record itself.
+    """Return the voter record's own address, cleaned only of PDF layout artifacts.
 
-    Only remove a trailing token when it is clearly the current PDF page number.
-    Header metadata is added later by ``compose_full_address`` so ``raw_address``
-    can still retain the exact address line extracted from the PDF.
+    Important: do NOT merge page-header metadata (post office / post code / ward)
+    into the address. Those values already have dedicated Firestore fields.
     """
     x = clean_field(value)
+
+    # Legacy Bijoy-style extraction can place chandrabindu before the aa-kar,
+    # e.g. "গঁাও". Reorder it to standard Unicode display: "গাঁও".
+    x = x.replace('\u0981\u09be', '\u09be\u0981')
+
+    # Page/header text can bleed into the last record of a column. Remove only
+    # known layout labels while preserving address text that may continue after
+    # the label (e.g. "... ইসলামপুর, ন্ত ভোটার তালিকাজামালপুর").
+    x = re.sub(r'\s*(?:চূড়ান্ত|চূড়ান্ত|ন্ত)?\s*ভোটার\s*তালিকা\s*', ' ', x)
+    x = re.sub(r'\s*রেজিস্ট্রেশন\s*অফিসার\s*$', '', x)
+
+    # Remove a leaked PDF page number only when it equals the current page.
     m = re.search(r'\s+([0-9০-৯]{1,3})\s*$', x)
     if m and bn_to_en(m.group(1)) == str(page_no):
         x = x[:m.start()].strip()
+
+    # Normalize separators introduced when a header label was removed.
+    x = re.sub(r'\s*,\s*', ', ', x)
+    x = re.sub(r',\s*,+', ', ', x)
+    x = re.sub(r'\s{2,}', ' ', x)
     return clean_field(x)
-
-
-def compose_full_address(value: str, page_no: int, district: str, upazila: str, meta: Dict[str, str]) -> str:
-    """Build a fuller display address from the record line + page header.
-
-    The voter box usually contains a short Bengali address ending in
-    ``উপজেলা, জেলা``.  The page header separately contains post office, post code
-    and ward.  Keep the Bengali geographic tail from the PDF address, and insert
-    the header metadata before it.  The English district/upazila arguments remain
-    in their dedicated Firestore fields for searching.
-    """
-    base = clean_address(value, page_no, district)
-    parts = [clean_field(x) for x in re.split(r'\s*,\s*', base) if clean_field(x)]
-
-    # In these voter-list PDFs the final two comma-separated components are the
-    # Bengali upazila and district. Preserve those display labels instead of
-    # appending the English API selector values.
-    if len(parts) >= 3:
-        locality = parts[:-2]
-        display_upazila = parts[-2]
-        display_district = parts[-1]
-    else:
-        locality = parts
-        display_upazila = clean_field(upazila)
-        display_district = clean_field(district)
-
-    out: List[str] = []
-    for item in locality:
-        if item and item not in out:
-            out.append(item)
-
-    post_office = clean_field(meta.get('post_office', ''))
-    post_code = clean_field(meta.get('post_code', ''))
-    ward_no = clean_field(meta.get('ward_no', ''))
-
-    if post_office:
-        out.append(f'ডাকঘর: {post_office}')
-    if post_code:
-        out.append(f'পোস্ট কোড: {post_code}')
-    if ward_no:
-        out.append(f'ওয়ার্ড: {ward_no}')
-    if display_upazila:
-        out.append(display_upazila)
-    if display_district:
-        out.append(display_district)
-
-    return ', '.join(out) if out else base
 
 
 def _field(text: str, pattern: str) -> str:
@@ -370,11 +339,11 @@ def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, car
             'mother_name': _field(ctext, r'মাতা\s*:\s*(.*?)(?=\s*পেশা\s*:|$)'),
             'profession': normalize_profession(_field(ctext, r'পেশা\s*:\s*(.*?)(?=\s*জন্ম\s*তারিখ\s*:|$)')),
             'birth_date': _field(ctext, r'জন্ম\s*তারিখ\s*:\s*([0-9০-৯/.-]+)'),
-            'address': compose_full_address(raw_address_value, page_no, district, upazila, meta),
+            'address': clean_address(raw_address_value, page_no, district),
             'union_name': meta.get('union_name', ''), 'post_office': meta.get('post_office', ''), 'post_code': meta.get('post_code', ''),
             'voter_area': meta.get('voter_area', ''), 'voter_area_code': meta.get('voter_area_code', ''), 'ward_no': meta.get('ward_no', ''),
             'source_file': file_name, 'created_at': datetime.now(timezone.utc).isoformat(),
-            'parser_version': 'PY-RENDER-V3-FULL-ADDRESS', 'text_encoding': 'unicode-bn-server-v1',
+            'parser_version': 'PY-RENDER-V4-ADDRESS-CORRECTED', 'text_encoding': 'unicode-bn-server-v1',
             'raw_pdf_text': raw_cell, 'parser_source_text': ctext,
         }
         row['raw_name'] = row['name']
