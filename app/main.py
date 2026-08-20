@@ -132,7 +132,7 @@ def target_db(fid='primary'):
         app_obj=firebase_admin.initialize_app(credentials.Certificate(info),name=app_name)
     return firestore.client(app=app_obj)
 
-app=FastAPI(title=APP_NAME,version='8.2.0')
+app=FastAPI(title=APP_NAME,version='8.3.0')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins or ['*'],allow_credentials=False,allow_methods=['GET','POST','DELETE','OPTIONS'],allow_headers=['*'])
 
@@ -190,7 +190,62 @@ def write_rows(rows,db):
     return written,batches
 
 @app.get('/health')
-def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.2-MULTI-FIREBASE-QUOTA-SAFE','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.3-MULTI-FIREBASE-PUBLIC-SEARCH','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+
+
+
+def _public_search_targets():
+    targets=[('primary','Primary Firebase',primary_db)]
+    try:
+        for snap in registry_db.collection('_sv_firebase_registry').stream():
+            d=snap.to_dict() or {}
+            if not d.get('enabled',True):
+                continue
+            try:
+                targets.append((snap.id,d.get('name',snap.id),target_db(snap.id)))
+            except Exception as exc:
+                print(f'PUBLIC_SEARCH_TARGET_SKIP {snap.id}: {type(exc).__name__}: {exc}',flush=True)
+    except Exception as exc:
+        print(f'PUBLIC_SEARCH_REGISTRY_ERROR {type(exc).__name__}: {exc}',flush=True)
+    return targets
+
+@app.get('/public/search')
+def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str=''):
+    district=district.strip(); upazila=upazila.strip()
+    if not district or not upazila:
+        raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
+    wanted={
+        'name':name.strip().casefold(),
+        'father_name':father.strip().casefold(),
+        'mother_name':mother.strip().casefold(),
+        'birth_date':dob.strip().casefold(),
+    }
+    rows=[]; errors=[]
+    for fid,fname,dbx in _public_search_targets():
+        try:
+            q=(dbx.collection('records')
+               .where(filter=FieldFilter('district_name','==',district))
+               .where(filter=FieldFilter('upazila_name','==',upazila)))
+            for snap in q.stream():
+                d=snap.to_dict() or {}
+                ok=True
+                for field,needle in wanted.items():
+                    if needle and needle not in str(d.get(field,'')).strip().casefold():
+                        ok=False; break
+                if not ok:
+                    continue
+                d['_firebase_id']=fid
+                d['_firebase_name']=fname
+                rows.append(d)
+        except Exception as exc:
+            errors.append({'firebase_id':fid,'error':type(exc).__name__})
+            print(f'PUBLIC_SEARCH_DB_ERROR {fid}: {type(exc).__name__}: {exc}',flush=True)
+    uniq={}
+    for d in rows:
+        key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
+        if key not in uniq:
+            uniq[key]=d
+    return {'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors}
 
 @app.get('/firebase/public-registry')
 def public_registry():
