@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import time
+import random
 from datetime import datetime, timezone
 from typing import Iterable, List
 
@@ -11,7 +13,10 @@ from firebase_admin import auth, credentials, firestore
 
 from .parser import parse_pdf_bytes
 APP_NAME = 'SV Tech PDF Backend'
-MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '40'))
+MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
+WRITE_BATCH_SIZE = max(50, min(450, int(os.getenv('WRITE_BATCH_SIZE', '250'))))
+WRITE_PAUSE_MS = max(0, int(os.getenv('WRITE_PAUSE_MS', '120')))
+WRITE_MAX_ATTEMPTS = max(3, int(os.getenv('WRITE_MAX_ATTEMPTS', '8')))
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1', 'true', 'yes'}
 
@@ -31,7 +36,7 @@ def init_firebase():
 
 init_firebase()
 db = firestore.client()
-app = FastAPI(title=APP_NAME, version='4.0.0')
+app = FastAPI(title=APP_NAME, version='7.0.0')
 
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS', '*').split(',') if x.strip()]
 app.add_middleware(
@@ -76,35 +81,62 @@ def comparable(d: dict):
     return {k: v for k, v in d.items() if k not in ignore}
 
 
+def _commit_batch_with_retry(batch, max_attempts: int | None = None):
+    """Commit one Firestore batch with exponential backoff + jitter.
+
+    This handles temporary 429/503/deadline errors. A hard daily Firestore
+    quota still cannot be bypassed by application code.
+    """
+    attempts = max_attempts or WRITE_MAX_ATTEMPTS
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return batch.commit()
+        except Exception as exc:
+            last_error = exc
+            text = f"{type(exc).__name__}: {exc}".lower()
+            retryable = any(x in text for x in (
+                'resourceexhausted', 'quota exceeded', '429',
+                'serviceunavailable', '503', 'deadlineexceeded', 'deadline exceeded',
+                'aborted', 'too many requests'
+            ))
+            if not retryable or attempt == attempts - 1:
+                raise
+            base = min(20.0, 1.5 * (2 ** attempt))
+            time.sleep(base + random.uniform(0.0, 0.8))
+    raise last_error
+
+
 def write_rows(rows: List[dict]):
-    refs = [db.collection('records').document(safe_doc_id(r)) for r in rows]
-    existing = {}
-    for ref_chunk in chunks(refs, 400):
-        for snap in db.get_all(ref_chunk):
-            existing[snap.reference.path] = snap.to_dict() if snap.exists else None
-    added = updated = unchanged = 0
-    write_items = []
-    for row, ref in zip(rows, refs):
-        old = existing.get(ref.path)
-        if old is None:
-            added += 1
-            write_items.append((ref, row))
-        elif comparable(old) == comparable(row):
-            unchanged += 1
-        else:
-            updated += 1
-            write_items.append((ref, row))
-    for part in chunks(write_items, 400):
+    """Large-PDF direct upsert with ZERO pre-read queries.
+
+    Records are written with deterministic document IDs in conservative chunks.
+    The method is idempotent: re-uploading after a partial failure overwrites the
+    same document IDs instead of creating a second copy.
+    """
+    total = len(rows)
+    written = 0
+    batch_commits = 0
+    write_items = [
+        (db.collection('records').document(safe_doc_id(row)), row)
+        for row in rows
+    ]
+    for part in chunks(write_items, WRITE_BATCH_SIZE):
         batch = db.batch()
         for ref, row in part:
             batch.set(ref, row, merge=True)
-        batch.commit()
-    return added, updated, unchanged
+        _commit_batch_with_retry(batch)
+        written += len(part)
+        batch_commits += 1
+        print(f"UPLOAD_PROGRESS {written}/{total} records ({batch_commits} batches)", flush=True)
+        if WRITE_PAUSE_MS:
+            time.sleep(WRITE_PAUSE_MS / 1000.0)
+    return written, batch_commits
 
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'service': APP_NAME, 'parser': 'PY-RENDER-V4-ADDRESS-CORRECTED'}
+    return {'ok': True, 'service': APP_NAME, 'parser': 'PY-RENDER-V7-LARGE-PDF', 'write_mode': 'large_pdf_chunked_upsert_no_preread', 'batch_size': WRITE_BATCH_SIZE, 'max_pdf_mb': MAX_PDF_MB}
 
 async def read_pdf(file: UploadFile) -> bytes:
     if file.content_type not in ('application/pdf', 'application/octet-stream') and not file.filename.lower().endswith('.pdf'):
@@ -136,7 +168,7 @@ async def preview(
         'records_detected': len(rows),
         'raw_preserved': raw_kept,
         'preview': rows[:20],
-        'parser': 'PY-RENDER-V4-ADDRESS-CORRECTED',
+        'parser': 'PY-RENDER-V7-LARGE-PDF',
     }
 
 @app.post('/upload')
@@ -153,14 +185,26 @@ async def upload(
         raise HTTPException(status_code=422, detail=f'PDF parse করা যায়নি: {e}') from e
     if not rows:
         raise HTTPException(status_code=422, detail='PDF থেকে কোনো Record শনাক্ত করা যায়নি')
-    added, updated, unchanged = write_rows(rows)
+    try:
+        written, batch_commits = write_rows(rows)
+    except Exception as e:
+        text = f"{type(e).__name__}: {e}"
+        if '429' in text or 'Quota' in text or 'ResourceExhausted' in text:
+            raise HTTPException(
+                status_code=429,
+                detail='Firestore write quota/rate limit reached. এই version upload-এর আগে কোনো document read করে না; quota reset/upgrade ছাড়া hard write quota bypass করা যায় না.'
+            ) from e
+        raise HTTPException(status_code=500, detail=f'Firestore write failed: {text}') from e
     raw_kept = sum(1 for r in rows if r.get('parse_status') == 'raw_preserved')
     log = {
         'district_name': district.strip(), 'upazila_name': upazila.strip(), 'file_name': file.filename,
-        'records_detected': len(rows), 'records_added': added, 'records_updated': updated,
-        'records_unchanged': unchanged, 'records_skipped': 0, 'raw_preserved': raw_kept,
+        'records_detected': len(rows), 'records_written': written, 'batch_commits': batch_commits,
+        'records_added': written, 'records_updated': 0, 'records_unchanged': 0,
+        'records_skipped': 0, 'raw_preserved': raw_kept,
         'created_at': datetime.now(timezone.utc).isoformat(), 'uploaded_by': user.get('email', ''),
-        'parser': 'PY-RENDER-V4-ADDRESS-CORRECTED — PDF address preserved; layout artifacts cleaned',
+        'parser': 'PY-RENDER-V7-LARGE-PDF — zero pre-read; chunked direct upsert',
+        'write_mode': 'large_pdf_chunked_upsert_no_preread',
+        'batch_size': WRITE_BATCH_SIZE,
     }
     db.collection('pdf_imports').document('import_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')).set(log)
     return {'ok': True, **log}
