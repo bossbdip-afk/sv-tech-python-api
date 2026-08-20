@@ -127,6 +127,10 @@ def repair_bangla(s: str) -> str:
 
 def clean_field(s: str) -> str:
     x = clean_unicode_bangla(s)
+    # Some legacy Bangla PDFs extract chandrabindu before the aa-kar (e.g. 'চঁান').
+    # Standard Unicode order is aa-kar + chandrabindu ('চাঁন'). Apply this to every
+    # field so names are fixed too, not only addresses.
+    x = x.replace('ঁা', 'াঁ')
     x = re.sub(r"([ক-হড়ঢ়য়ািীুূৃেৈোৌংঃঁ])['’`]([ক-হড়ঢ়য়ািীুূৃেৈোৌংঃঁ])", r'\1\2', x)
     x = re.sub(r'^[\s,.;:।]+', '', x)
     x = re.sub(r'[\s,;]+$', '', x)
@@ -343,7 +347,7 @@ def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, car
             'union_name': meta.get('union_name', ''), 'post_office': meta.get('post_office', ''), 'post_code': meta.get('post_code', ''),
             'voter_area': meta.get('voter_area', ''), 'voter_area_code': meta.get('voter_area_code', ''), 'ward_no': meta.get('ward_no', ''),
             'source_file': file_name, 'created_at': datetime.now(timezone.utc).isoformat(),
-            'parser_version': 'PY-RENDER-V4-ADDRESS-CORRECTED', 'text_encoding': 'unicode-bn-server-v1',
+            'parser_version': 'PY-RENDER-V5-FATHER-UNICODE-FIXED', 'text_encoding': 'unicode-bn-server-v1',
             'raw_pdf_text': raw_cell, 'parser_source_text': ctext,
         }
         row['raw_name'] = row['name']
