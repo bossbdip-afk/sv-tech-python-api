@@ -66,6 +66,60 @@ def init_registry_db():
 
 registry_db, REGISTRY_SOURCE = init_registry_db()
 
+def _env_firebase_accounts():
+    out={}
+    for key,val in os.environ.items():
+        if not key.startswith('FIREBASE_SERVICE_ACCOUNT_') or key=='FIREBASE_SERVICE_ACCOUNT_JSON':
+            continue
+        raw=str(val or '').strip()
+        if not raw: continue
+        try: info=json.loads(raw)
+        except Exception: continue
+        project_id=str(info.get('project_id') or '').strip()
+        if not project_id: continue
+        out[project_id]={'env_key':key,'info':info}
+    return out
+
+def _registry_docs_safe():
+    out={}
+    try:
+        for snap in registry_db.collection('_sv_firebase_registry').stream():
+            d=snap.to_dict() or {}
+            out[snap.id]=d
+    except Exception as exc:
+        print(f'REGISTRY_LIST_FALLBACK {type(exc).__name__}: {exc}',flush=True)
+    return out
+
+def firebase_catalog(include_disabled=True):
+    """Merge Firestore registry + Render env credentials. Registry failure must not hide configured Firebase projects."""
+    primary_project=str((PRIMARY_INFO or {}).get('project_id') or 'primary')
+    items=[{'id':'primary','name':'Primary Firebase','project_id':primary_project,'enabled':True,'primary':True,'service_env_key':'FIREBASE_SERVICE_ACCOUNT_JSON'}]
+    regs=_registry_docs_safe()
+    by_project={str((d or {}).get('project_id') or '').strip():(fid,d) for fid,d in regs.items() if str((d or {}).get('project_id') or '').strip()}
+    seen={primary_project}
+    for project_id,entry in sorted(_env_firebase_accounts().items()):
+        if project_id in seen: continue
+        seen.add(project_id)
+        if project_id in by_project:
+            fid,d=by_project[project_id]
+            enabled=bool(d.get('enabled',True))
+            name=str(d.get('name') or project_id)
+            env_key=str(d.get('service_env_key') or entry['env_key'])
+            pub=d.get('public_config') or {}
+        else:
+            fid=clean_id(project_id)
+            enabled=True; name=project_id; env_key=entry['env_key']; pub={}
+        if include_disabled or enabled:
+            items.append({'id':fid,'name':name,'project_id':project_id,'enabled':enabled,'primary':False,'service_env_key':env_key,'public_config':pub})
+    # Registry records whose env var is temporarily unavailable are still visible in Manager.
+    for fid,d in regs.items():
+        project_id=str(d.get('project_id') or '').strip()
+        if not project_id or project_id in seen: continue
+        enabled=bool(d.get('enabled',True))
+        if include_disabled or enabled:
+            items.append({'id':fid,'name':str(d.get('name') or fid),'project_id':project_id,'enabled':enabled,'primary':False,'service_env_key':str(d.get('service_env_key') or ''),'public_config':d.get('public_config') or {}})
+    return items
+
 def cipher():
     material=(PRIMARY_INFO or {}).get('private_key','') + '|' + (PRIMARY_INFO or {}).get('project_id','')
     key=base64.urlsafe_b64encode(hashlib.sha256(material.encode()).digest())
@@ -83,9 +137,16 @@ def registry_ref(fid): return registry_db.collection('_sv_firebase_registry').do
 
 def get_registry_doc(fid):
     if fid in ('','primary',None): return None
-    snap=registry_ref(fid).get()
-    if not snap.exists: raise HTTPException(404,'Firebase configuration পাওয়া যায়নি')
-    return snap.to_dict()
+    try:
+        snap=registry_ref(fid).get()
+        if snap.exists: return snap.to_dict() or {}
+    except Exception as exc:
+        print(f'REGISTRY_GET_FALLBACK {fid}: {type(exc).__name__}: {exc}',flush=True)
+    # Fall back to Render env catalog so a registry quota/outage cannot break routing.
+    for item in firebase_catalog(include_disabled=True):
+        if item['id']==fid or item['project_id']==fid:
+            return {'name':item['name'],'project_id':item['project_id'],'enabled':item['enabled'],'service_env_key':item.get('service_env_key',''),'public_config':item.get('public_config',{})}
+    raise HTTPException(404,'Firebase configuration পাওয়া যায়নি')
 
 def _service_account_from_registry(reg):
     env_key=str(reg.get('service_env_key') or '').strip()
@@ -132,7 +193,7 @@ def target_db(fid='primary'):
         app_obj=firebase_admin.initialize_app(credentials.Certificate(info),name=app_name)
     return firestore.client(app=app_obj)
 
-app=FastAPI(title=APP_NAME,version='8.3.0')
+app=FastAPI(title=APP_NAME,version='8.4.0')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins or ['*'],allow_credentials=False,allow_methods=['GET','POST','DELETE','OPTIONS'],allow_headers=['*'])
 
@@ -176,37 +237,41 @@ def write_rows(rows,db):
         commit_retry(b); written+=len(part); batches+=1
         print(f'UPLOAD_PROGRESS {written}/{total}',flush=True)
         if WRITE_PAUSE_MS: time.sleep(WRITE_PAUSE_MS/1000)
-    # Tiny metadata write; avoids future dashboard-wide scans.
+    # Keep compact distinct-area metadata so dashboard aggregation does not scan all records on every refresh.
     try:
+        ref=db.collection('_sv_meta').document('stats')
         districts={str(r.get('district_name','')).strip() for r in rows if str(r.get('district_name','')).strip()}
         upazilas={(str(r.get('district_name','')).strip(),str(r.get('upazila_name','')).strip()) for r in rows if str(r.get('upazila_name','')).strip()}
-        db.collection('_sv_meta').document('stats').set({
-            'districts': max(1,len(districts)) if districts else 0,
-            'upazilas': max(1,len(upazilas)) if upazilas else 0,
-            'updated_at': datetime.now(timezone.utc).isoformat()
+        try:
+            snap=ref.get(); oldm=(snap.to_dict() or {}) if snap.exists else {}
+            districts |= {str(x).strip() for x in oldm.get('district_values',[]) if str(x).strip()}
+            for x in oldm.get('upazila_values',[]):
+                parts=str(x).split('|||',1)
+                if len(parts)==2 and parts[1].strip(): upazilas.add((parts[0].strip(),parts[1].strip()))
+        except Exception:
+            pass
+        ref.set({
+            'district_values':sorted(districts),
+            'upazila_values':sorted(d+'|||'+u for d,u in upazilas),
+            'districts':len(districts),'upazilas':len(upazilas),
+            'updated_at':datetime.now(timezone.utc).isoformat()
         },merge=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f'META_UPDATE_SKIP {type(exc).__name__}: {exc}',flush=True)
     return written,batches
 
 @app.get('/health')
-def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.3-MULTI-FIREBASE-PUBLIC-SEARCH','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.4-MULTI-FIREBASE-AGGREGATE','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
 
 
 
 def _public_search_targets():
-    targets=[('primary','Primary Firebase',primary_db)]
-    try:
-        for snap in registry_db.collection('_sv_firebase_registry').stream():
-            d=snap.to_dict() or {}
-            if not d.get('enabled',True):
-                continue
-            try:
-                targets.append((snap.id,d.get('name',snap.id),target_db(snap.id)))
-            except Exception as exc:
-                print(f'PUBLIC_SEARCH_TARGET_SKIP {snap.id}: {type(exc).__name__}: {exc}',flush=True)
-    except Exception as exc:
-        print(f'PUBLIC_SEARCH_REGISTRY_ERROR {type(exc).__name__}: {exc}',flush=True)
+    targets=[]
+    for item in firebase_catalog(include_disabled=False):
+        try:
+            targets.append((item['id'],item['name'],target_db(item['id'])))
+        except Exception as exc:
+            print(f'PUBLIC_SEARCH_TARGET_SKIP {item["id"]}: {type(exc).__name__}: {exc}',flush=True)
     return targets
 
 @app.get('/public/search')
@@ -250,17 +315,16 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
 @app.get('/firebase/public-registry')
 def public_registry():
     out=[]
-    for s in registry_db.collection('_sv_firebase_registry').stream():
-        d=s.to_dict()
-        if d.get('enabled',True): out.append({'id':s.id,'name':d.get('name',s.id),'config':d.get('public_config',{})})
+    for item in firebase_catalog(include_disabled=False):
+        if item['id']=='primary': continue
+        cfg=item.get('public_config') or {}
+        if cfg:
+            out.append({'id':item['id'],'name':item['name'],'config':cfg})
     return {'ok':True,'firebases':out}
 
 @app.get('/firebase/list')
 def firebase_list(user=Depends(current_user)):
-    out=[{'id':'primary','name':'Primary Firebase','project_id':(PRIMARY_INFO or {}).get('project_id','primary'),'enabled':True,'primary':True}]
-    for s in registry_db.collection('_sv_firebase_registry').stream():
-        d=s.to_dict(); out.append({'id':s.id,'name':d.get('name',s.id),'project_id':d.get('project_id',''),'enabled':d.get('enabled',True),'primary':False})
-    return {'ok':True,'firebases':out}
+    return {'ok':True,'firebases':[{k:v for k,v in x.items() if k!='public_config' and k!='service_env_key'} for x in firebase_catalog(include_disabled=True)]}
 
 @app.post('/firebase/add')
 async def firebase_add(name:str=Form(...),public_config:str=Form(...),user=Depends(current_user)):
@@ -313,22 +377,68 @@ def query_count(q):
         raise
     return 0
 
-@app.get('/firebase/stats')
-def firebase_stats(firebase_id:str='primary',user=Depends(current_user)):
-    db=target_db(firebase_id)
-    try:
-        total=query_count(db.collection('records'))
-    except Exception as e:
-        # Dashboard should still load even if one Firebase has exhausted read quota.
-        return {'ok':False,'total':0,'districts':0,'upazilas':0,'warning':f'stats unavailable: {type(e).__name__}'}
-    # Distinct counts are maintained lazily by uploads; avoid a full collection scan.
+
+def _meta_area_sets(db, rebuild_if_missing=True):
+    ref=db.collection('_sv_meta').document('stats')
     meta={}
     try:
-        snap=db.collection('_sv_meta').document('stats').get()
+        snap=ref.get()
         if snap.exists: meta=snap.to_dict() or {}
     except Exception:
         meta={}
-    return {'ok':True,'total':total,'districts':int(meta.get('districts',0) or 0),'upazilas':int(meta.get('upazilas',0) or 0)}
+    dvals={str(x).strip() for x in meta.get('district_values',[]) if str(x).strip()}
+    uvals=set()
+    for x in meta.get('upazila_values',[]):
+        parts=str(x).split('|||',1)
+        if len(parts)==2 and parts[1].strip(): uvals.add((parts[0].strip(),parts[1].strip()))
+    if (dvals or uvals) or not rebuild_if_missing:
+        return dvals,uvals
+    # One-time legacy metadata rebuild. It is persisted, so future dashboard loads are cheap.
+    try:
+        q=db.collection('records').select(['district_name','upazila_name'])
+        for snap in q.stream():
+            row=snap.to_dict() or {}
+            d=str(row.get('district_name','')).strip(); u=str(row.get('upazila_name','')).strip()
+            if d: dvals.add(d)
+            if u: uvals.add((d,u))
+        ref.set({'district_values':sorted(dvals),'upazila_values':sorted(d+'|||'+u for d,u in uvals),'districts':len(dvals),'upazilas':len(uvals),'updated_at':datetime.now(timezone.utc).isoformat()},merge=True)
+    except Exception as exc:
+        print(f'META_REBUILD_SKIP {type(exc).__name__}: {exc}',flush=True)
+    return dvals,uvals
+
+def _stats_for_db(db):
+    total=query_count(db.collection('records'))
+    dvals,uvals=_meta_area_sets(db,True)
+    return total,dvals,uvals
+
+@app.get('/firebase/stats')
+def firebase_stats(firebase_id:str='primary',user=Depends(current_user)):
+    try:
+        total,dvals,uvals=_stats_for_db(target_db(firebase_id))
+        return {'ok':True,'total':total,'districts':len(dvals),'upazilas':len(uvals)}
+    except Exception as e:
+        return {'ok':False,'total':0,'districts':0,'upazilas':0,'warning':f'stats unavailable: {type(e).__name__}'}
+
+@app.get('/firebase/stats-all')
+def firebase_stats_all(user=Depends(current_user)):
+    total=0; districts=set(); upazilas=set(); sources=[]; errors=[]
+    for item in firebase_catalog(include_disabled=False):
+        try:
+            t,ds,us=_stats_for_db(target_db(item['id']))
+            total+=t; districts|=ds; upazilas|=us
+            sources.append({'id':item['id'],'name':item['name'],'total':t})
+        except Exception as exc:
+            errors.append({'id':item['id'],'name':item['name'],'error':type(exc).__name__})
+            print(f'STATS_ALL_SKIP {item["id"]}: {type(exc).__name__}: {exc}',flush=True)
+    return {'ok':True,'total':total,'districts':len(districts),'upazilas':len(upazilas),'sources':sources,'errors':errors}
+
+@app.get('/firebase/areas')
+def firebase_areas(firebase_id:str='primary',user=Depends(current_user)):
+    try:
+        ds,us=_meta_area_sets(target_db(firebase_id),True)
+        return {'ok':True,'districts':sorted(ds),'upazilas':[{'district':d,'upazila':u} for d,u in sorted(us)]}
+    except Exception as exc:
+        raise HTTPException(503,f'এলাকার তালিকা পাওয়া যায়নি: {type(exc).__name__}') from exc
 
 @app.get('/firebase/count')
 def firebase_count(firebase_id:str='primary',district:str='',upazila:str='',user=Depends(current_user)):
@@ -343,8 +453,14 @@ def firebase_delete_records(firebase_id:str='primary',district:str='',upazila:st
     db=target_db(firebase_id); q=db.collection('records').where(filter=FieldFilter('district_name','==',district)).where(filter=FieldFilter('upazila_name','==',upazila)); docs=list(q.stream()); deleted=0
     for part in chunks(docs,400):
         b=db.batch()
-        for s in part: b.delete(s.reference)
+        for snap in part: b.delete(snap.reference)
         commit_retry(b); deleted+=len(part)
+    # Rebuild compact area metadata after destructive delete so aggregate unique counts stay correct.
+    try:
+        db.collection('_sv_meta').document('stats').set({'district_values':[],'upazila_values':[],'districts':0,'upazilas':0},merge=True)
+        _meta_area_sets(db,True)
+    except Exception as exc:
+        print(f'META_AFTER_DELETE_SKIP {type(exc).__name__}: {exc}',flush=True)
     return {'ok':True,'deleted':deleted}
 
 async def read_pdf(file:UploadFile):
