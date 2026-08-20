@@ -182,6 +182,95 @@ def _find_service_account_env(project_id):
     matches.sort(key=lambda x:x[0])
     return matches[0]
 
+
+
+_RECORD_STORE_CACHE={}
+_RECORD_FIELD_ALIASES={
+    'voter_no':('voter_no','voter','voterNo','voter_number','voterNumber'),
+    'name':('name','full_name','fullName','voter_name','voterName'),
+    'father_name':('father_name','father','fatherName'),
+    'mother_name':('mother_name','mother','motherName'),
+    'birth_date':('birth_date','dob','birthDate','date_of_birth'),
+    'district_name':('district_name','district','districtName'),
+    'upazila_name':('upazila_name','upazila','upazilla','upazilaName','thana'),
+}
+
+def _pick_record_fields(sample):
+    sample=sample or {}
+    keys=set(sample.keys())
+    out={}
+    for std,aliases in _RECORD_FIELD_ALIASES.items():
+        out[std]=next((x for x in aliases if x in keys),std)
+    return out
+
+def _looks_like_voter_row(row):
+    if not isinstance(row,dict) or not row: return False
+    keys=set(row.keys())
+    voter=any(k in keys for k in _RECORD_FIELD_ALIASES['voter_no'])
+    name=any(k in keys for k in _RECORD_FIELD_ALIASES['name'])
+    area=any(k in keys for k in _RECORD_FIELD_ALIASES['district_name']) or any(k in keys for k in _RECORD_FIELD_ALIASES['upazila_name'])
+    family=any(k in keys for k in _RECORD_FIELD_ALIASES['father_name']) or any(k in keys for k in _RECORD_FIELD_ALIASES['mother_name'])
+    return voter and name and (area or family)
+
+def _sample_collection(col):
+    try:
+        docs=list(col.limit(3).stream())
+    except Exception:
+        return None,False
+    if not docs: return {},False
+    rows=[d.to_dict() or {} for d in docs]
+    sample=next((r for r in rows if _looks_like_voter_row(r)),rows[0])
+    return sample,any(_looks_like_voter_row(r) for r in rows)
+
+def record_store(db):
+    """Resolve the voter collection/schema without breaking current `records` installs.
+
+    V8.4 assumed every Firebase used a collection literally named `records`. Older
+    SV Tech projects can contain the same voter rows in a legacy collection and/or
+    with legacy field names. Prefer a populated `records` collection; otherwise
+    auto-detect one voter-shaped top-level collection and cache the choice.
+    """
+    key=str(getattr(db,'project',None) or id(db))
+    cached=_RECORD_STORE_CACHE.get(key)
+    if cached: return cached
+
+    standard=db.collection('records')
+    sample,has_voters=_sample_collection(standard)
+    if sample and has_voters:
+        result=(standard,_pick_record_fields(sample),'records')
+        _RECORD_STORE_CACHE[key]=result
+        return result
+
+    candidates=[]
+    try:
+        for col in db.collections():
+            cid=str(getattr(col,'id','') or '')
+            if not cid or cid=='records' or cid.startswith('_'): continue
+            row,ok=_sample_collection(col)
+            if ok:
+                candidates.append((cid,col,row))
+    except Exception as exc:
+        print(f'RECORD_STORE_SCAN_SKIP {key}: {type(exc).__name__}: {exc}',flush=True)
+
+    if candidates:
+        # Deterministic preference for common legacy names, then alphabetically.
+        preferred={'voters':0,'voter':1,'voter_data':2,'voterdata':3,'data':4}
+        candidates.sort(key=lambda x:(preferred.get(x[0].lower(),50),x[0].lower()))
+        cid,col,row=candidates[0]
+        print(f'RECORD_STORE_LEGACY {key}: {cid}',flush=True)
+        result=(col,_pick_record_fields(row),cid)
+    else:
+        # Empty/new Firebase: preserve V8.4 write behavior.
+        result=(standard,{k:k for k in _RECORD_FIELD_ALIASES},'records')
+    _RECORD_STORE_CACHE[key]=result
+    return result
+
+def _row_standardized(row,fields):
+    d=dict(row or {})
+    for std,actual in fields.items():
+        if std not in d and actual in d: d[std]=d.get(actual)
+    return d
+
 def target_db(fid='primary'):
     if fid in ('','primary',None): return primary_db
     reg=get_registry_doc(fid)
@@ -193,7 +282,7 @@ def target_db(fid='primary'):
         app_obj=firebase_admin.initialize_app(credentials.Certificate(info),name=app_name)
     return firestore.client(app=app_obj)
 
-app=FastAPI(title=APP_NAME,version='8.4.0')
+app=FastAPI(title=APP_NAME,version='8.5.0')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins or ['*'],allow_credentials=False,allow_methods=['GET','POST','DELETE','OPTIONS'],allow_headers=['*'])
 
@@ -230,7 +319,8 @@ def commit_retry(batch):
 
 def write_rows(rows,db):
     written=batches=0; total=len(rows)
-    items=[(db.collection('records').document(safe_doc_id(r)),r) for r in rows]
+    col,_,_=record_store(db)
+    items=[(col.document(safe_doc_id(r)),r) for r in rows]
     for part in chunks(items,WRITE_BATCH_SIZE):
         b=db.batch()
         for ref,row in part: b.set(ref,row,merge=True)
@@ -261,7 +351,7 @@ def write_rows(rows,db):
     return written,batches
 
 @app.get('/health')
-def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.4-MULTI-FIREBASE-AGGREGATE','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.5-LEGACY-PRIMARY-COMPAT','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
 
 
 
@@ -288,11 +378,12 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     rows=[]; errors=[]
     for fid,fname,dbx in _public_search_targets():
         try:
-            q=(dbx.collection('records')
-               .where(filter=FieldFilter('district_name','==',district))
-               .where(filter=FieldFilter('upazila_name','==',upazila)))
+            col,fields,_=record_store(dbx)
+            q=(col
+               .where(filter=FieldFilter(fields['district_name'],'==',district))
+               .where(filter=FieldFilter(fields['upazila_name'],'==',upazila)))
             for snap in q.stream():
-                d=snap.to_dict() or {}
+                d=_row_standardized(snap.to_dict() or {},fields)
                 ok=True
                 for field,needle in wanted.items():
                     if needle and needle not in str(d.get(field,'')).strip().casefold():
@@ -395,9 +486,10 @@ def _meta_area_sets(db, rebuild_if_missing=True):
         return dvals,uvals
     # One-time legacy metadata rebuild. It is persisted, so future dashboard loads are cheap.
     try:
-        q=db.collection('records').select(['district_name','upazila_name'])
+        col,fields,_=record_store(db)
+        q=col.select([fields['district_name'],fields['upazila_name']])
         for snap in q.stream():
-            row=snap.to_dict() or {}
+            row=_row_standardized(snap.to_dict() or {},fields)
             d=str(row.get('district_name','')).strip(); u=str(row.get('upazila_name','')).strip()
             if d: dvals.add(d)
             if u: uvals.add((d,u))
@@ -407,7 +499,8 @@ def _meta_area_sets(db, rebuild_if_missing=True):
     return dvals,uvals
 
 def _stats_for_db(db):
-    total=query_count(db.collection('records'))
+    col,_,_=record_store(db)
+    total=query_count(col)
     dvals,uvals=_meta_area_sets(db,True)
     return total,dvals,uvals
 
@@ -426,7 +519,8 @@ def firebase_stats_all(user=Depends(current_user)):
         try:
             t,ds,us=_stats_for_db(target_db(item['id']))
             total+=t; districts|=ds; upazilas|=us
-            sources.append({'id':item['id'],'name':item['name'],'total':t})
+            col,_,cname=record_store(target_db(item['id']))
+            sources.append({'id':item['id'],'name':item['name'],'total':t,'collection':cname})
         except Exception as exc:
             errors.append({'id':item['id'],'name':item['name'],'error':type(exc).__name__})
             print(f'STATS_ALL_SKIP {item["id"]}: {type(exc).__name__}: {exc}',flush=True)
@@ -436,21 +530,22 @@ def firebase_stats_all(user=Depends(current_user)):
 def firebase_areas(firebase_id:str='primary',user=Depends(current_user)):
     try:
         ds,us=_meta_area_sets(target_db(firebase_id),True)
-        return {'ok':True,'districts':sorted(ds),'upazilas':[{'district':d,'upazila':u} for d,u in sorted(us)]}
+        _,_,cname=record_store(target_db(firebase_id))
+        return {'ok':True,'districts':sorted(ds),'upazilas':[{'district':d,'upazila':u} for d,u in sorted(us)],'collection':cname}
     except Exception as exc:
         raise HTTPException(503,f'এলাকার তালিকা পাওয়া যায়নি: {type(exc).__name__}') from exc
 
 @app.get('/firebase/count')
 def firebase_count(firebase_id:str='primary',district:str='',upazila:str='',user=Depends(current_user)):
-    q=target_db(firebase_id).collection('records')
-    if district: q=q.where(filter=FieldFilter('district_name','==',district))
-    if upazila: q=q.where(filter=FieldFilter('upazila_name','==',upazila))
+    db=target_db(firebase_id); col,fields,_=record_store(db); q=col
+    if district: q=q.where(filter=FieldFilter(fields['district_name'],'==',district))
+    if upazila: q=q.where(filter=FieldFilter(fields['upazila_name'],'==',upazila))
     return {'ok':True,'count':query_count(q)}
 
 @app.delete('/firebase/records')
 def firebase_delete_records(firebase_id:str='primary',district:str='',upazila:str='',user=Depends(current_user)):
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
-    db=target_db(firebase_id); q=db.collection('records').where(filter=FieldFilter('district_name','==',district)).where(filter=FieldFilter('upazila_name','==',upazila)); docs=list(q.stream()); deleted=0
+    db=target_db(firebase_id); col,fields,_=record_store(db); q=col.where(filter=FieldFilter(fields['district_name'],'==',district)).where(filter=FieldFilter(fields['upazila_name'],'==',upazila)); docs=list(q.stream()); deleted=0
     for part in chunks(docs,400):
         b=db.batch()
         for snap in part: b.delete(snap.reference)
