@@ -57,6 +57,40 @@ def get_registry_doc(fid):
     if not snap.exists: raise HTTPException(404,'Firebase configuration পাওয়া যায়নি')
     return snap.to_dict()
 
+def _service_account_from_registry(reg):
+    env_key=str(reg.get('service_env_key') or '').strip()
+    if env_key:
+        raw=os.getenv(env_key,'').strip()
+        if not raw:
+            raise HTTPException(500,f'Render Environment variable {env_key} পাওয়া যায়নি')
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            raise HTTPException(500,f'{env_key} JSON সঠিক নয়') from e
+    enc=reg.get('service_account_enc')
+    if enc:
+        return decrypt_json(enc)
+    raise HTTPException(500,'এই Firebase-এর secure credential পাওয়া যায়নি')
+
+def _find_service_account_env(project_id):
+    matches=[]
+    for key,val in os.environ.items():
+        if not key.startswith('FIREBASE_SERVICE_ACCOUNT_') or key=='FIREBASE_SERVICE_ACCOUNT_JSON':
+            continue
+        raw=str(val or '').strip()
+        if not raw:
+            continue
+        try:
+            obj=json.loads(raw)
+        except Exception:
+            continue
+        if str(obj.get('project_id') or '').strip()==project_id:
+            matches.append((key,obj))
+    if not matches:
+        return None,None
+    matches.sort(key=lambda x:x[0])
+    return matches[0]
+
 def target_db(fid='primary'):
     if fid in ('','primary',None): return control_db
     reg=get_registry_doc(fid)
@@ -64,11 +98,11 @@ def target_db(fid='primary'):
     app_name='target_'+clean_id(fid)
     try: app_obj=firebase_admin.get_app(app_name)
     except ValueError:
-        info=decrypt_json(reg['service_account_enc'])
+        info=_service_account_from_registry(reg)
         app_obj=firebase_admin.initialize_app(credentials.Certificate(info),name=app_name)
     return firestore.client(app=app_obj)
 
-app=FastAPI(title=APP_NAME,version='8.0.0')
+app=FastAPI(title=APP_NAME,version='8.1.0')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins or ['*'],allow_credentials=False,allow_methods=['GET','POST','DELETE','OPTIONS'],allow_headers=['*'])
 
@@ -115,7 +149,7 @@ def write_rows(rows,db):
     return written,batches
 
 @app.get('/health')
-def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8-MULTI-FIREBASE','write_mode':'selected_firebase_chunked_upsert','batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.1-MULTI-FIREBASE-SECURE-ENV','write_mode':'selected_firebase_chunked_upsert_secure_env','batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
 
 @app.get('/firebase/public-registry')
 def public_registry():
@@ -133,22 +167,35 @@ def firebase_list(user=Depends(current_user)):
     return {'ok':True,'firebases':out}
 
 @app.post('/firebase/add')
-async def firebase_add(name:str=Form(...),public_config:str=Form(...),service_account:str=Form(...),user=Depends(current_user)):
-    try: pub=json.loads(public_config); svc=json.loads(service_account)
-    except Exception as e: raise HTTPException(400,'Firebase config বা Service Account JSON সঠিক নয়') from e
-    project_id=str(pub.get('projectId') or svc.get('project_id') or '').strip()
-    if not project_id: raise HTTPException(400,'projectId পাওয়া যায়নি')
-    if svc.get('project_id') and svc.get('project_id')!=project_id: raise HTTPException(400,'Web config এবং Service Account একই project-এর নয়')
+async def firebase_add(name:str=Form(...),public_config:str=Form(...),user=Depends(current_user)):
+    try:
+        pub=json.loads(public_config)
+    except Exception as e:
+        raise HTTPException(400,'Firebase Web Config JSON সঠিক নয়') from e
+    project_id=str(pub.get('projectId') or '').strip()
+    if not project_id:
+        raise HTTPException(400,'Web Config-এ projectId পাওয়া যায়নি')
+    env_key,svc=_find_service_account_env(project_id)
+    if not env_key or not svc:
+        raise HTTPException(400,'Render Environment-এ এই project-এর Service Account পাওয়া যায়নি। FIREBASE_SERVICE_ACCOUNT_... key-তে পুরো JSON save করে আবার চেষ্টা করুন।')
     fid=clean_id(project_id)
-    # Validate credential before saving.
     test_name='validate_'+fid
     try:
         try: test_app=firebase_admin.get_app(test_name)
         except ValueError: test_app=firebase_admin.initialize_app(credentials.Certificate(svc),name=test_name)
         firestore.client(app=test_app).collection('records').limit(1).get()
-    except Exception as e: raise HTTPException(400,f'Firebase credential/Firestore connect হয়নি: {e}') from e
-    registry_ref(fid).set({'name':name.strip() or project_id,'project_id':project_id,'public_config':pub,'service_account_enc':encrypt_json(svc),'enabled':True,'created_at':datetime.now(timezone.utc).isoformat(),'created_by':user.get('email','')},merge=True)
-    return {'ok':True,'id':fid,'name':name.strip() or project_id,'project_id':project_id}
+    except Exception as e:
+        raise HTTPException(400,f'Firebase credential/Firestore connect হয়নি: {e}') from e
+    registry_ref(fid).set({
+        'name':name.strip() or project_id,
+        'project_id':project_id,
+        'public_config':pub,
+        'service_env_key':env_key,
+        'enabled':True,
+        'created_at':datetime.now(timezone.utc).isoformat(),
+        'created_by':user.get('email','')
+    },merge=True)
+    return {'ok':True,'id':fid,'name':name.strip() or project_id,'project_id':project_id,'credential_source':'render_env','service_env_key':env_key}
 
 @app.post('/firebase/toggle')
 async def firebase_toggle(firebase_id:str=Form(...),enabled:str=Form(...),user=Depends(current_user)):
