@@ -34,7 +34,37 @@ def init_primary():
         firebase_admin.initialize_app(credentials.Certificate(PRIMARY_INFO)); return
     raise RuntimeError('FIREBASE_SERVICE_ACCOUNT_JSON is required')
 init_primary()
-control_db=firestore.client()
+primary_db=firestore.client()
+
+def init_registry_db():
+    # Keep the Firebase registry off the primary project so a primary read-quota
+    # exhaustion cannot break Firebase Manager. Prefer an explicit registry
+    # credential; otherwise auto-pick the first extra FIREBASE_SERVICE_ACCOUNT_* env.
+    raw=os.getenv('FIREBASE_REGISTRY_SERVICE_ACCOUNT_JSON','').strip()
+    env_key='FIREBASE_REGISTRY_SERVICE_ACCOUNT_JSON'
+    info=None
+    if raw:
+        try: info=json.loads(raw)
+        except Exception as e: raise RuntimeError('FIREBASE_REGISTRY_SERVICE_ACCOUNT_JSON is invalid JSON') from e
+    if info is None:
+        candidates=[]
+        for key,val in os.environ.items():
+            if not key.startswith('FIREBASE_SERVICE_ACCOUNT_') or key=='FIREBASE_SERVICE_ACCOUNT_JSON':
+                continue
+            try: obj=json.loads(str(val or '').strip())
+            except Exception: continue
+            if obj.get('project_id'): candidates.append((key,obj))
+        candidates.sort(key=lambda x:x[0])
+        if candidates:
+            env_key,info=candidates[0]
+    if info is None:
+        return primary_db, 'primary'
+    try: app_obj=firebase_admin.get_app('registry_control')
+    except ValueError:
+        app_obj=firebase_admin.initialize_app(credentials.Certificate(info),name='registry_control')
+    return firestore.client(app=app_obj), env_key
+
+registry_db, REGISTRY_SOURCE = init_registry_db()
 
 def cipher():
     material=(PRIMARY_INFO or {}).get('private_key','') + '|' + (PRIMARY_INFO or {}).get('project_id','')
@@ -49,7 +79,7 @@ def clean_id(s):
     out=''.join(ch.lower() if ch.isalnum() else '-' for ch in str(s).strip())
     return '-'.join(x for x in out.split('-') if x)[:80] or 'firebase'
 
-def registry_ref(fid): return control_db.collection('_sv_firebase_registry').document(fid)
+def registry_ref(fid): return registry_db.collection('_sv_firebase_registry').document(fid)
 
 def get_registry_doc(fid):
     if fid in ('','primary',None): return None
@@ -92,7 +122,7 @@ def _find_service_account_env(project_id):
     return matches[0]
 
 def target_db(fid='primary'):
-    if fid in ('','primary',None): return control_db
+    if fid in ('','primary',None): return primary_db
     reg=get_registry_doc(fid)
     if not reg.get('enabled',True): raise HTTPException(400,'এই Firebase disabled আছে')
     app_name='target_'+clean_id(fid)
@@ -102,7 +132,7 @@ def target_db(fid='primary'):
         app_obj=firebase_admin.initialize_app(credentials.Certificate(info),name=app_name)
     return firestore.client(app=app_obj)
 
-app=FastAPI(title=APP_NAME,version='8.1.0')
+app=FastAPI(title=APP_NAME,version='8.2.0')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins or ['*'],allow_credentials=False,allow_methods=['GET','POST','DELETE','OPTIONS'],allow_headers=['*'])
 
@@ -146,15 +176,26 @@ def write_rows(rows,db):
         commit_retry(b); written+=len(part); batches+=1
         print(f'UPLOAD_PROGRESS {written}/{total}',flush=True)
         if WRITE_PAUSE_MS: time.sleep(WRITE_PAUSE_MS/1000)
+    # Tiny metadata write; avoids future dashboard-wide scans.
+    try:
+        districts={str(r.get('district_name','')).strip() for r in rows if str(r.get('district_name','')).strip()}
+        upazilas={(str(r.get('district_name','')).strip(),str(r.get('upazila_name','')).strip()) for r in rows if str(r.get('upazila_name','')).strip()}
+        db.collection('_sv_meta').document('stats').set({
+            'districts': max(1,len(districts)) if districts else 0,
+            'upazilas': max(1,len(upazilas)) if upazilas else 0,
+            'updated_at': datetime.now(timezone.utc).isoformat()
+        },merge=True)
+    except Exception:
+        pass
     return written,batches
 
 @app.get('/health')
-def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.1-MULTI-FIREBASE-SECURE-ENV','write_mode':'selected_firebase_chunked_upsert_secure_env','batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.2-MULTI-FIREBASE-QUOTA-SAFE','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
 
 @app.get('/firebase/public-registry')
 def public_registry():
     out=[]
-    for s in control_db.collection('_sv_firebase_registry').stream():
+    for s in registry_db.collection('_sv_firebase_registry').stream():
         d=s.to_dict()
         if d.get('enabled',True): out.append({'id':s.id,'name':d.get('name',s.id),'config':d.get('public_config',{})})
     return {'ok':True,'firebases':out}
@@ -162,7 +203,7 @@ def public_registry():
 @app.get('/firebase/list')
 def firebase_list(user=Depends(current_user)):
     out=[{'id':'primary','name':'Primary Firebase','project_id':(PRIMARY_INFO or {}).get('project_id','primary'),'enabled':True,'primary':True}]
-    for s in control_db.collection('_sv_firebase_registry').stream():
+    for s in registry_db.collection('_sv_firebase_registry').stream():
         d=s.to_dict(); out.append({'id':s.id,'name':d.get('name',s.id),'project_id':d.get('project_id',''),'enabled':d.get('enabled',True),'primary':False})
     return {'ok':True,'firebases':out}
 
@@ -203,17 +244,43 @@ async def firebase_toggle(firebase_id:str=Form(...),enabled:str=Form(...),user=D
     registry_ref(firebase_id).set({'enabled':enabled.lower() in {'1','true','yes','on'}},merge=True)
     return {'ok':True}
 
+def query_count(q):
+    # Firestore aggregation count avoids streaming every document.
+    try:
+        results=q.count().get()
+        for item in results:
+            # google-cloud-firestore versions return either AggregationResult
+            # or a tuple/list containing one.
+            obj=item[0] if isinstance(item,(tuple,list)) and item else item
+            val=getattr(obj,'value',None)
+            if val is not None: return int(val)
+    except Exception:
+        raise
+    return 0
+
 @app.get('/firebase/stats')
 def firebase_stats(firebase_id:str='primary',user=Depends(current_user)):
-    db=target_db(firebase_id); docs=list(db.collection('records').stream()); a=[x.to_dict() for x in docs]
-    return {'ok':True,'total':len(a),'districts':len(set(x.get('district_name','') for x in a)),'upazilas':len(set((x.get('district_name',''),x.get('upazila_name','')) for x in a))}
+    db=target_db(firebase_id)
+    try:
+        total=query_count(db.collection('records'))
+    except Exception as e:
+        # Dashboard should still load even if one Firebase has exhausted read quota.
+        return {'ok':False,'total':0,'districts':0,'upazilas':0,'warning':f'stats unavailable: {type(e).__name__}'}
+    # Distinct counts are maintained lazily by uploads; avoid a full collection scan.
+    meta={}
+    try:
+        snap=db.collection('_sv_meta').document('stats').get()
+        if snap.exists: meta=snap.to_dict() or {}
+    except Exception:
+        meta={}
+    return {'ok':True,'total':total,'districts':int(meta.get('districts',0) or 0),'upazilas':int(meta.get('upazilas',0) or 0)}
 
 @app.get('/firebase/count')
 def firebase_count(firebase_id:str='primary',district:str='',upazila:str='',user=Depends(current_user)):
     q=target_db(firebase_id).collection('records')
     if district: q=q.where(filter=FieldFilter('district_name','==',district))
     if upazila: q=q.where(filter=FieldFilter('upazila_name','==',upazila))
-    return {'ok':True,'count':sum(1 for _ in q.stream())}
+    return {'ok':True,'count':query_count(q)}
 
 @app.delete('/firebase/records')
 def firebase_delete_records(firebase_id:str='primary',district:str='',upazila:str='',user=Depends(current_user)):
