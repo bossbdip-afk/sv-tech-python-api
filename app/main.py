@@ -223,45 +223,25 @@ def _sample_collection(col):
     return sample,any(_looks_like_voter_row(r) for r in rows)
 
 def record_store(db):
-    """Resolve the voter collection/schema without breaking current `records` installs.
+    """Return the configured voter collection without enumerating Firestore collections.
 
-    V8.4 assumed every Firebase used a collection literally named `records`. Older
-    SV Tech projects can contain the same voter rows in a legacy collection and/or
-    with legacy field names. Prefer a populated `records` collection; otherwise
-    auto-detect one voter-shaped top-level collection and cache the choice.
+    V8.6 quota-safety rule: never call ``db.collections()`` to guess a legacy
+    collection. The deployed V8.4 application used ``records`` for Primary and
+    all managed Firebase projects, so keep that known-good path. An optional
+    backend-only env override can be used for a genuinely different project
+    without exposing anything to the frontend.
     """
     key=str(getattr(db,'project',None) or id(db))
     cached=_RECORD_STORE_CACHE.get(key)
     if cached: return cached
 
-    standard=db.collection('records')
-    sample,has_voters=_sample_collection(standard)
-    if sample and has_voters:
-        result=(standard,_pick_record_fields(sample),'records')
-        _RECORD_STORE_CACHE[key]=result
-        return result
-
-    candidates=[]
-    try:
-        for col in db.collections():
-            cid=str(getattr(col,'id','') or '')
-            if not cid or cid=='records' or cid.startswith('_'): continue
-            row,ok=_sample_collection(col)
-            if ok:
-                candidates.append((cid,col,row))
-    except Exception as exc:
-        print(f'RECORD_STORE_SCAN_SKIP {key}: {type(exc).__name__}: {exc}',flush=True)
-
-    if candidates:
-        # Deterministic preference for common legacy names, then alphabetically.
-        preferred={'voters':0,'voter':1,'voter_data':2,'voterdata':3,'data':4}
-        candidates.sort(key=lambda x:(preferred.get(x[0].lower(),50),x[0].lower()))
-        cid,col,row=candidates[0]
-        print(f'RECORD_STORE_LEGACY {key}: {cid}',flush=True)
-        result=(col,_pick_record_fields(row),cid)
-    else:
-        # Empty/new Firebase: preserve V8.4 write behavior.
-        result=(standard,{k:k for k in _RECORD_FIELD_ALIASES},'records')
+    project=str(getattr(db,'project',None) or '').strip()
+    primary_project=str((PRIMARY_INFO or {}).get('project_id') or '').strip()
+    env_name='FIREBASE_RECORD_COLLECTION_PRIMARY' if project and project==primary_project else 'FIREBASE_RECORD_COLLECTION'
+    cname=str(os.getenv(env_name,'') or os.getenv('FIREBASE_RECORD_COLLECTION','') or 'records').strip() or 'records'
+    col=db.collection(cname)
+    fields={k:k for k in _RECORD_FIELD_ALIASES}
+    result=(col,fields,cname)
     _RECORD_STORE_CACHE[key]=result
     return result
 
@@ -282,7 +262,7 @@ def target_db(fid='primary'):
         app_obj=firebase_admin.initialize_app(credentials.Certificate(info),name=app_name)
     return firestore.client(app=app_obj)
 
-app=FastAPI(title=APP_NAME,version='8.5.0')
+app=FastAPI(title=APP_NAME,version='8.6.0')
 origins=[x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware,allow_origins=origins or ['*'],allow_credentials=False,allow_methods=['GET','POST','DELETE','OPTIONS'],allow_headers=['*'])
 
@@ -351,7 +331,7 @@ def write_rows(rows,db):
     return written,batches
 
 @app.get('/health')
-def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.5-LEGACY-PRIMARY-COMPAT','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.6-PRIMARY-QUOTA-SAFE','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
 
 
 
@@ -484,18 +464,28 @@ def _meta_area_sets(db, rebuild_if_missing=True):
         if len(parts)==2 and parts[1].strip(): uvals.add((parts[0].strip(),parts[1].strip()))
     if (dvals or uvals) or not rebuild_if_missing:
         return dvals,uvals
-    # One-time legacy metadata rebuild. It is persisted, so future dashboard loads are cheap.
+
+    # V8.6: never rebuild area metadata by streaming the entire records collection.
+    # Historical upload logs are tiny compared with voter records and already carry
+    # district/upazila, so recover metadata from those instead.
     try:
-        col,fields,_=record_store(db)
-        q=col.select([fields['district_name'],fields['upazila_name']])
+        q=db.collection('pdf_imports').select(['district_name','upazila_name']).limit(2000)
         for snap in q.stream():
-            row=_row_standardized(snap.to_dict() or {},fields)
+            row=snap.to_dict() or {}
             d=str(row.get('district_name','')).strip(); u=str(row.get('upazila_name','')).strip()
             if d: dvals.add(d)
             if u: uvals.add((d,u))
-        ref.set({'district_values':sorted(dvals),'upazila_values':sorted(d+'|||'+u for d,u in uvals),'districts':len(dvals),'upazilas':len(uvals),'updated_at':datetime.now(timezone.utc).isoformat()},merge=True)
+        if dvals or uvals:
+            ref.set({
+                'district_values':sorted(dvals),
+                'upazila_values':sorted(d+'|||'+u for d,u in uvals),
+                'districts':len(dvals),'upazilas':len(uvals),
+                'updated_at':datetime.now(timezone.utc).isoformat(),
+                'source':'pdf_imports_v8_6'
+            },merge=True)
+            print(f'META_RECOVERED_FROM_IMPORTS {getattr(db,"project","")}: {len(dvals)} districts, {len(uvals)} upazilas',flush=True)
     except Exception as exc:
-        print(f'META_REBUILD_SKIP {type(exc).__name__}: {exc}',flush=True)
+        print(f'META_IMPORT_RECOVERY_SKIP {type(exc).__name__}: {exc}',flush=True)
     return dvals,uvals
 
 def _stats_for_db(db):
