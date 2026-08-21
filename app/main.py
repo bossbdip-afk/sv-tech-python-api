@@ -314,24 +314,33 @@ def write_rows(rows,db):
         upazilas={(str(r.get('district_name','')).strip(),str(r.get('upazila_name','')).strip()) for r in rows if str(r.get('upazila_name','')).strip()}
         try:
             snap=ref.get(); oldm=(snap.to_dict() or {}) if snap.exists else {}
-            districts |= {str(x).strip() for x in oldm.get('district_values',[]) if str(x).strip()}
-            for x in oldm.get('upazila_values',[]):
-                parts=str(x).split('|||',1)
-                if len(parts)==2 and parts[1].strip(): upazilas.add((parts[0].strip(),parts[1].strip()))
+            if oldm.get('source')=='records_exact_v8_7':
+                districts |= {_norm_area(x) for x in oldm.get('district_values',[]) if _norm_area(x)}
+                for x in oldm.get('upazila_values',[]):
+                    parts=str(x).split('|||',1)
+                    if len(parts)==2:
+                        od=_norm_area(parts[0]); ou=_norm_area(parts[1])
+                        if ou: upazilas.add((od,ou))
+            else:
+                # Older metadata can contain deleted historical areas. Since the
+                # new rows are already committed, rebuild exact metadata now.
+                _rebuild_area_meta_from_records(db)
+                return written,batches
         except Exception:
             pass
         ref.set({
             'district_values':sorted(districts),
             'upazila_values':sorted(d+'|||'+u for d,u in upazilas),
             'districts':len(districts),'upazilas':len(upazilas),
-            'updated_at':datetime.now(timezone.utc).isoformat()
+            'updated_at':datetime.now(timezone.utc).isoformat(),
+            'source':'records_exact_v8_7'
         },merge=True)
     except Exception as exc:
         print(f'META_UPDATE_SKIP {type(exc).__name__}: {exc}',flush=True)
     return written,batches
 
 @app.get('/health')
-def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.6-PRIMARY-QUOTA-SAFE','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
+def health(): return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V8.7-EXACT-AREA-STATS','write_mode':'selected_firebase_chunked_upsert_secure_env','registry_source':REGISTRY_SOURCE,'batch_size':WRITE_BATCH_SIZE,'max_pdf_mb':MAX_PDF_MB}
 
 
 
@@ -449,6 +458,42 @@ def query_count(q):
     return 0
 
 
+def _norm_area(v):
+    # Keep Bangla spelling intact while collapsing invisible/duplicate whitespace.
+    return ' '.join(str(v or '').replace('\u00a0',' ').split()).strip()
+
+
+def _rebuild_area_meta_from_records(db):
+    """One-time exact repair of district/upazila metadata from CURRENT records.
+
+    Older metadata could retain areas from PDFs that were later deleted because
+    pdf_imports is a historical log.  Scan only the two area fields, persist the
+    exact distinct sets, then normal dashboard refreshes use the compact metadata.
+    """
+    ref=db.collection('_sv_meta').document('stats')
+    col,fields,_=record_store(db)
+    dfield=fields['district_name']; ufield=fields['upazila_name']
+    dvals=set(); uvals=set()
+    try:
+        q=col.select([dfield,ufield])
+    except Exception:
+        q=col
+    for snap in q.stream():
+        row=snap.to_dict() or {}
+        d=_norm_area(row.get(dfield,'')); u=_norm_area(row.get(ufield,''))
+        if d: dvals.add(d)
+        if u: uvals.add((d,u))
+    ref.set({
+        'district_values':sorted(dvals),
+        'upazila_values':sorted(d+'|||'+u for d,u in uvals),
+        'districts':len(dvals),'upazilas':len(uvals),
+        'updated_at':datetime.now(timezone.utc).isoformat(),
+        'source':'records_exact_v8_7'
+    },merge=True)
+    print(f'META_EXACT_REBUILT {getattr(db,"project","")}: {len(dvals)} districts, {len(uvals)} upazilas',flush=True)
+    return dvals,uvals
+
+
 def _meta_area_sets(db, rebuild_if_missing=True):
     ref=db.collection('_sv_meta').document('stats')
     meta={}
@@ -457,36 +502,26 @@ def _meta_area_sets(db, rebuild_if_missing=True):
         if snap.exists: meta=snap.to_dict() or {}
     except Exception:
         meta={}
-    dvals={str(x).strip() for x in meta.get('district_values',[]) if str(x).strip()}
+
+    dvals={_norm_area(x) for x in meta.get('district_values',[]) if _norm_area(x)}
     uvals=set()
     for x in meta.get('upazila_values',[]):
         parts=str(x).split('|||',1)
-        if len(parts)==2 and parts[1].strip(): uvals.add((parts[0].strip(),parts[1].strip()))
-    if (dvals or uvals) or not rebuild_if_missing:
-        return dvals,uvals
-
-    # V8.6: never rebuild area metadata by streaming the entire records collection.
-    # Historical upload logs are tiny compared with voter records and already carry
-    # district/upazila, so recover metadata from those instead.
-    try:
-        q=db.collection('pdf_imports').select(['district_name','upazila_name']).limit(2000)
-        for snap in q.stream():
-            row=snap.to_dict() or {}
-            d=str(row.get('district_name','')).strip(); u=str(row.get('upazila_name','')).strip()
-            if d: dvals.add(d)
+        if len(parts)==2:
+            d=_norm_area(parts[0]); u=_norm_area(parts[1])
             if u: uvals.add((d,u))
-        if dvals or uvals:
-            ref.set({
-                'district_values':sorted(dvals),
-                'upazila_values':sorted(d+'|||'+u for d,u in uvals),
-                'districts':len(dvals),'upazilas':len(uvals),
-                'updated_at':datetime.now(timezone.utc).isoformat(),
-                'source':'pdf_imports_v8_6'
-            },merge=True)
-            print(f'META_RECOVERED_FROM_IMPORTS {getattr(db,"project","")}: {len(dvals)} districts, {len(uvals)} upazilas',flush=True)
+
+    # V8.7: metadata created by older versions may include deleted historical areas.
+    # Repair it once from the CURRENT record collection, then use compact metadata.
+    if meta.get('source')=='records_exact_v8_7':
+        return dvals,uvals
+    if not rebuild_if_missing:
+        return dvals,uvals
+    try:
+        return _rebuild_area_meta_from_records(db)
     except Exception as exc:
-        print(f'META_IMPORT_RECOVERY_SKIP {type(exc).__name__}: {exc}',flush=True)
-    return dvals,uvals
+        print(f'META_EXACT_REBUILD_SKIP {type(exc).__name__}: {exc}',flush=True)
+        return dvals,uvals
 
 def _stats_for_db(db):
     col,_,_=record_store(db)
@@ -542,8 +577,8 @@ def firebase_delete_records(firebase_id:str='primary',district:str='',upazila:st
         commit_retry(b); deleted+=len(part)
     # Rebuild compact area metadata after destructive delete so aggregate unique counts stay correct.
     try:
-        db.collection('_sv_meta').document('stats').set({'district_values':[],'upazila_values':[],'districts':0,'upazilas':0},merge=True)
-        _meta_area_sets(db,True)
+        db.collection('_sv_meta').document('stats').set({'district_values':[],'upazila_values':[],'districts':0,'upazilas':0,'source':'needs_exact_rebuild_v8_7'},merge=True)
+        _rebuild_area_meta_from_records(db)
     except Exception as exc:
         print(f'META_AFTER_DELETE_SKIP {type(exc).__name__}: {exc}',flush=True)
     return {'ok':True,'deleted':deleted}
